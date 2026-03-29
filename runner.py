@@ -24,6 +24,11 @@ import sys
 import threading
 import time
 
+# Windows: reconfigure stdout to UTF-8 so emoji/Unicode in LLM output never crashes
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import numpy as np
 import requests
 import soundfile as sf

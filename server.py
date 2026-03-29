@@ -156,6 +156,41 @@ def check_dependencies() -> dict:
     }
 
 
+def _find_ffmpeg_windows() -> str:
+    """
+    Try to locate ffmpeg.exe on Windows even when PATH hasn't been refreshed
+    after a winget/choco install. Returns the full path or empty string.
+    """
+    # 1. Already on current PATH
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    # 2. Common winget install location
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    winget_path = os.path.join(local_app, "Microsoft", "WinGet", "Packages")
+    if os.path.isdir(winget_path):
+        for root, dirs, files in os.walk(winget_path):
+            if "ffmpeg.exe" in files:
+                return os.path.join(root, "ffmpeg.exe")
+
+    # 3. Common choco install location
+    choco_path = r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"
+    if os.path.isfile(choco_path):
+        return choco_path
+
+    # 4. Common manual install locations
+    for candidate in [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+
+    return ""
+
+
 def _ffmpeg_install_hint() -> str:
     system = platform.system()
     if system == "Windows":
@@ -521,6 +556,15 @@ def deploy_station(station_id: str) -> dict:
     """
     station    = _get_station(station_id)
     station_dir = STATIONS_DIR / station_id
+
+    # On Windows, winget/choco install ffmpeg to a path that may not be in the
+    # current shell's PATH yet (requires a new shell to take effect).
+    # Detect the ffmpeg binary location and persist it to config so the runner
+    # can always find it regardless of PATH state.
+    if platform.system() == "Windows" and not station.get("ffmpeg"):
+        ffmpeg_path = _find_ffmpeg_windows()
+        if ffmpeg_path:
+            station["ffmpeg"] = ffmpeg_path
 
     # Write config
     config_path = station_dir / "station_config.json"
