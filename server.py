@@ -912,7 +912,11 @@ def _run_musicgen(prompt: str, wav_path: pathlib.Path) -> dict:
         audio_np = audio[0, 0].cpu().numpy()
         sr       = model.config.audio_encoder.sampling_rate
         duration = len(audio_np) / sr
-        wav_io.write(str(wav_path), sr, audio_np.astype("float32"))
+        # Normalize to [-1, 1] then convert to int16 — float32 WAVs with out-of-range
+        # values produce high-pitched noise when decoded by ffmpeg
+        peak = max(abs(audio_np).max(), 1e-6)
+        audio_int16 = (audio_np / peak * 32767).clip(-32768, 32767).astype("int16")
+        wav_io.write(str(wav_path), sr, audio_int16)
 
         del model  # free VRAM
         return {"ok": True, "path": str(wav_path), "duration_secs": round(duration, 1),
