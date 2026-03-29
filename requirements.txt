@@ -4,3 +4,10 @@ kokoro>=0.9.0
 soundfile>=0.12.1
 numpy>=1.24.0
 python-dotenv>=1.0.0
+
+# Optional — AI music generation (facebook/musicgen-small)
+# Install via: pip install torch transformers scipy
+# Or call install_music_deps() from the MCP server
+# torch>=2.0.0
+# transformers>=4.35.0
+# scipy>=1.10.0

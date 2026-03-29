@@ -272,6 +272,101 @@ def get_segment(minute: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Music generation (optional — requires torch + transformers)
+# ---------------------------------------------------------------------------
+
+MUSIC_LIBRARY_TARGET = 20  # grow library up to this many tracks then rotate
+
+
+def _run_musicgen(prompt: str, wav_path: pathlib.Path):
+    """Generate a ~30s track with facebook/musicgen-small. Runs in a thread."""
+    try:
+        import torch
+        import scipy.io.wavfile as wav_io
+        from transformers import MusicgenForConditionalGeneration, AutoProcessor
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small", local_files_only=True).to(device)
+            processor = AutoProcessor.from_pretrained(
+                "facebook/musicgen-small", local_files_only=True)
+        except Exception:
+            model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small").to(device)
+            processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+
+        inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            audio = model.generate(**inputs, max_new_tokens=1500)
+
+        audio_np = audio[0, 0].cpu().numpy()
+        sr       = model.config.audio_encoder.sampling_rate
+        duration = len(audio_np) / sr
+        wav_io.write(str(wav_path), sr, audio_np.astype("float32"))
+        print(f"[musicgen] Generated {wav_path.name} ({duration:.1f}s)")
+        del model
+
+        # Loop the track ~3 minutes worth into the queue
+        loops = max(1, int(180 / duration) + 1)
+        for _ in range(loops):
+            audio_queue.put(wav_path)
+    except ImportError:
+        print("[musicgen] torch/transformers not installed — skipping generation")
+    except Exception as e:
+        print(f"[musicgen] generation failed: {e}")
+
+
+def _get_music_prompt() -> str:
+    """Build a music generation prompt from station content config."""
+    topics = cfg.get("content", {}).get("params", {}).get("topics", [])
+    dj_name = cfg.get("dj", {}).get("name", "")
+    base = "upbeat electronic music, synthesizer, energetic radio background"
+    if topics:
+        base = f"upbeat electronic music inspired by {', '.join(topics[:3])}"
+    if dj_name:
+        base += f", radio station background for {dj_name}"
+    return base
+
+
+async def handle_music_segment():
+    """Play from music_library; grow library in background if not full yet."""
+    tracks = sorted(MUSIC_DIR.glob("*.wav")) + sorted(MUSIC_DIR.glob("*.mp3"))
+
+    if tracks:
+        if audio_queue.empty():
+            track = random.choice(tracks)
+            # Loop it to fill ~3 minutes
+            try:
+                import scipy.io.wavfile as wav_io
+                sr, data = wav_io.read(str(track))
+                duration = len(data) / sr
+            except Exception:
+                duration = 30.0
+            loops = max(1, int(180 / duration) + 1)
+            for _ in range(loops):
+                audio_queue.put(track)
+            print(f"[music] Playing {track.name} x{loops}")
+
+        # Grow library in background if not full
+        if len(tracks) < MUSIC_LIBRARY_TARGET:
+            idx      = len(tracks) + 1
+            new_path = MUSIC_DIR / f"track_{idx:03d}.wav"
+            prompt   = _get_music_prompt()
+            print(f"[music] Growing library ({len(tracks)}/{MUSIC_LIBRARY_TARGET}) — generating in background")
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, _run_musicgen, prompt, new_path)
+
+    else:
+        # Empty library — generate first track (blocking)
+        print("[music] Library empty — generating first track (this takes a few minutes)...")
+        new_path = MUSIC_DIR / "track_001.wav"
+        prompt   = _get_music_prompt()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _run_musicgen, prompt, new_path)
+
+
+# ---------------------------------------------------------------------------
 # Main watcher loop
 # ---------------------------------------------------------------------------
 
@@ -297,9 +392,7 @@ async def watcher_loop():
         seg    = get_segment(minute)
 
         if seg == "music":
-            music_tracks = list(MUSIC_DIR.glob("*.wav")) + list(MUSIC_DIR.glob("*.mp3"))
-            if music_tracks and audio_queue.empty():
-                audio_queue.put(random.choice(music_tracks))
+            await handle_music_segment()
             await asyncio.sleep(10)
             continue
 

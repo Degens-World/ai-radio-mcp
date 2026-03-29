@@ -47,7 +47,12 @@ mcp = FastMCP(
         "5. set_personality / set_voice / set_content / set_schedule\n"
         "6. preview_config(station_id) — review before launch\n"
         "7. deploy_station(station_id) — go live\n"
-        "8. register_with_hub(station_id, public_stream_url) — list on Degens.World hub (no extra config needed)"
+        "8. register_with_hub(station_id, public_stream_url) — list on Degens.World hub (no extra config needed)\n"
+        "\n"
+        "Music generation (optional):\n"
+        "- install_music_deps() — install torch + transformers for MusicGen\n"
+        "- generate_music_track(station_id, prompt) — generate a new track with facebook/musicgen-small\n"
+        "- list_music_library(station_id) — see all tracks in the station's music library"
     ),
 )
 
@@ -203,6 +208,33 @@ def install_dependency(name: str) -> dict:
             "command": " ".join(cmd),
             "stdout":  result.stdout[-500:],
             "stderr":  result.stderr[-200:],
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def install_music_deps() -> dict:
+    """
+    Install Python packages required for AI music generation (MusicGen).
+    This is optional — stations work fine with a pre-populated music_library/.
+
+    Installs: torch, transformers, scipy
+    Note: torch can be large (~2GB). Requires a CUDA-capable GPU for fast generation;
+    falls back to CPU (slow but functional).
+    """
+    packages = ["torch", "transformers", "scipy"]
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install"] + packages,
+            capture_output=True, text=True, timeout=600,
+        )
+        ok = result.returncode == 0
+        return {
+            "status":   "installed" if ok else "error",
+            "packages": packages,
+            "output":   result.stdout[-500:],
+            "note":     "Generation uses GPU if available, otherwise CPU (~3-5 min per track on CPU).",
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -801,6 +833,125 @@ def delete_station(station_id: str) -> dict:
     _registry.pop(station_id, None)
     _save_registry()
     return {"status": "deleted", "station_id": station_id}
+
+
+# ---------------------------------------------------------------------------
+# ── MUSIC GENERATION TOOLS ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _run_musicgen(prompt: str, wav_path: pathlib.Path) -> dict:
+    """
+    Generate a ~30s music track using facebook/musicgen-small and save as WAV.
+    Requires torch + transformers (install via install_music_deps()).
+    """
+    try:
+        import torch
+        import scipy.io.wavfile as wav_io
+        from transformers import MusicgenForConditionalGeneration, AutoProcessor
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[musicgen] Loading model on {device}...")
+        try:
+            model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small", local_files_only=True).to(device)
+            processor = AutoProcessor.from_pretrained(
+                "facebook/musicgen-small", local_files_only=True)
+        except Exception:
+            model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small").to(device)
+            processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+
+        inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            audio = model.generate(**inputs, max_new_tokens=1500)  # ~30s
+
+        audio_np = audio[0, 0].cpu().numpy()
+        sr       = model.config.audio_encoder.sampling_rate
+        duration = len(audio_np) / sr
+        wav_io.write(str(wav_path), sr, audio_np.astype("float32"))
+
+        del model  # free VRAM
+        return {"ok": True, "path": str(wav_path), "duration_secs": round(duration, 1),
+                "sample_rate": sr, "device": device}
+    except ImportError:
+        return {"ok": False, "error": "torch/transformers not installed — run install_music_deps() first"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+def generate_music_track(
+    station_id: str,
+    prompt: str = "",
+    track_name: str = "",
+) -> dict:
+    """
+    Generate a new AI music track with facebook/musicgen-small and add it to
+    the station's music_library/.
+
+    Requires torch + transformers — run install_music_deps() first if needed.
+
+    Parameters
+    ----------
+    station_id  : Station to add the track to
+    prompt      : Music description (e.g. "lo-fi hip hop, chill beats, vinyl crackle").
+                  Leave blank for a generic electronic/ambient track.
+    track_name  : Optional filename (without extension). Auto-numbered if omitted.
+    """
+    station    = _get_station(station_id)
+    music_dir  = STATIONS_DIR / station_id / "music_library"
+    music_dir.mkdir(exist_ok=True)
+
+    if not prompt:
+        prompt = "upbeat electronic music, synthesizer, energetic radio background"
+
+    if track_name:
+        wav_path = music_dir / f"{track_name}.wav"
+    else:
+        existing = sorted(music_dir.glob("track_*.wav"))
+        idx      = len(existing) + 1
+        wav_path = music_dir / f"track_{idx:03d}.wav"
+
+    result = _run_musicgen(prompt, wav_path)
+    if result["ok"]:
+        return {
+            "status":       "generated",
+            "station_id":   station_id,
+            "file":         wav_path.name,
+            "path":         result["path"],
+            "duration_secs": result["duration_secs"],
+            "sample_rate":  result["sample_rate"],
+            "device":       result["device"],
+            "prompt":       prompt,
+            "note":         "Track added to music_library/ — will play automatically during music segments.",
+        }
+    else:
+        return {"status": "error", "station_id": station_id, **result}
+
+
+@mcp.tool()
+def list_music_library(station_id: str) -> dict:
+    """
+    List all tracks in a station's music_library/.
+    Shows filename and file size for each track.
+    """
+    _get_station(station_id)
+    music_dir = STATIONS_DIR / station_id / "music_library"
+    music_dir.mkdir(exist_ok=True)
+
+    tracks = sorted(music_dir.glob("*.wav")) + sorted(music_dir.glob("*.mp3"))
+    return {
+        "station_id": station_id,
+        "track_count": len(tracks),
+        "tracks": [
+            {"name": t.name, "size_mb": round(t.stat().st_size / 1_000_000, 2)}
+            for t in tracks
+        ],
+        "note": (
+            "Add tracks via generate_music_track() or copy WAV/MP3 files directly into "
+            f"{music_dir}"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
