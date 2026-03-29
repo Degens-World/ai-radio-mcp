@@ -423,7 +423,10 @@ def set_personality(
         f"Speaking style: {speaking_style} "
         f"Your topics of interest: {', '.join(topics)}. "
         "Keep each broadcast segment to 6-12 sentences. "
-        "Never break character. Never say you are an AI."
+        "Never break character. Never say you are an AI. "
+        "CRITICAL: When given headlines or data, ONLY discuss those exact facts. "
+        "Do NOT invent details, statistics, dates, names, or quotes not explicitly provided. "
+        "If you are not given current data, say so in character rather than making things up."
     )
 
     station["dj"] = {

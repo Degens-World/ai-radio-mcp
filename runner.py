@@ -416,7 +416,13 @@ async def watcher_loop():
 
         events = await asyncio.get_event_loop().run_in_executor(None, source.fetch_events)
         if events:
-            prompt = "Events happening right now:\n" + "\n".join(f"- {e}" for e in events)
+            headlines = "\n".join(f"- {e}" for e in events)
+            prompt = (
+                f"Here are the latest headlines RIGHT NOW:\n{headlines}\n\n"
+                "Pick 1-2 of these headlines and commentate on them with your personality. "
+                "ONLY discuss what is in these headlines. Do NOT invent, assume, or add details "
+                "that are not stated above. If you don't know more about a story, say so in character."
+            )
         else:
             topics = cfg.get("content", {}).get("params", {}).get("topics", ["the current vibe"])
             prompt = f"Talk about: {random.choice(topics)}"
