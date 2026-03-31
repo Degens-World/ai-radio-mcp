@@ -18,6 +18,7 @@ import os
 import pathlib
 import queue
 import random
+import signal
 import struct
 import subprocess
 import sys
@@ -68,6 +69,107 @@ ffmpeg_proc      = None
 _kokoro_pipeline = None
 clip_counter     = 0
 playback_end_time = 0.0
+
+# Hub registration state (populated after register call)
+_hub_station_id: str = ""
+_hub_api_key:    str = ""
+
+# ---------------------------------------------------------------------------
+# Hub registration helpers
+# ---------------------------------------------------------------------------
+
+_STATION_API_BASE = "https://qbziikoagfhvdihdqjqh.supabase.co/functions/v1/station-api"
+
+
+def _load_hub_credentials(base_dir: pathlib.Path) -> tuple[str, str]:
+    """Load station_id + api_key from .hub_credentials.json if it exists."""
+    cred_file = base_dir / ".hub_credentials.json"
+    if cred_file.exists():
+        try:
+            data = json.loads(cred_file.read_text(encoding="utf-8"))
+            return data.get("station_id", ""), data.get("api_key", "")
+        except Exception:
+            pass
+    return "", ""
+
+
+def _save_hub_credentials(base_dir: pathlib.Path, station_id: str, api_key: str) -> None:
+    cred_file = base_dir / ".hub_credentials.json"
+    cred_file.write_text(
+        json.dumps({"station_id": station_id, "api_key": api_key}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def hub_register(station_id: str, stream_url: str, station_cfg: dict) -> str:
+    """
+    POST to station-api to register. Returns the api_key (shown only once).
+    Saves credentials to .hub_credentials.json in BASE_DIR.
+    """
+    global _hub_station_id, _hub_api_key
+    body = {
+        "id":           station_id,
+        "name":         station_cfg.get("name", "AI Radio"),
+        "stream_url":   stream_url,
+        "tagline":      station_cfg.get("tagline", ""),
+        "dj_name":      station_cfg.get("dj", {}).get("name", ""),
+        "content_type": station_cfg.get("content", {}).get("source", "freestyle"),
+        "online":       True,
+    }
+    try:
+        resp = requests.post(
+            _STATION_API_BASE,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        api_key = resp.json().get("api_key", "")
+        _hub_station_id = station_id
+        _hub_api_key    = api_key
+        _save_hub_credentials(BASE_DIR, station_id, api_key)
+        print(f"[hub] Registered station '{station_id}' on Degens.World hub")
+        return api_key
+    except Exception as e:
+        print(f"[hub] Registration failed: {e}")
+        return ""
+
+
+def hub_heartbeat() -> None:
+    """PUT last_seen_at + online:true. Runs in background thread every 30s."""
+    if not _hub_station_id or not _hub_api_key:
+        return
+    try:
+        requests.put(
+            f"{_STATION_API_BASE}/{_hub_station_id}",
+            json={"last_seen_at": int(time.time() * 1000), "online": True},
+            headers={"x-api-key": _hub_api_key, "Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[hub] Heartbeat failed: {e}")
+
+
+def hub_deregister() -> None:
+    """DELETE station from hub. Called on clean shutdown."""
+    if not _hub_station_id or not _hub_api_key:
+        return
+    try:
+        requests.delete(
+            f"{_STATION_API_BASE}/{_hub_station_id}",
+            headers={"x-api-key": _hub_api_key},
+            timeout=10,
+        )
+        print(f"[hub] Deregistered station '{_hub_station_id}'")
+    except Exception as e:
+        print(f"[hub] Deregister failed: {e}")
+
+
+def _heartbeat_thread() -> None:
+    """Background thread: send hub heartbeat every 30 seconds."""
+    while True:
+        time.sleep(30)
+        hub_heartbeat()
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +545,7 @@ async def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="station_config.json")
+    parser.add_argument("--stream-url", default="", help="Public HLS URL for hub registration")
     args = parser.parse_args()
 
     cfg      = load_config(args.config)
@@ -490,6 +593,34 @@ async def main():
     # Start PCM writer
     threading.Thread(target=pcm_writer, daemon=True).start()
     print("[pcm] PCM writer started")
+
+    # Hub registration — use saved credentials if available, otherwise register fresh
+    public_url = args.stream_url or cfg.get("stream", {}).get("public_url", "")
+    if public_url:
+        saved_sid, saved_key = _load_hub_credentials(BASE_DIR)
+        station_id = cfg.get("hub_station_id") or saved_sid or cfg.get("name", "ai-radio").lower().replace(" ", "-")
+        if saved_key:
+            # Restore from previous run
+            global _hub_station_id, _hub_api_key
+            _hub_station_id = station_id
+            _hub_api_key    = saved_key
+            hub_heartbeat()
+            print(f"[hub] Restored credentials for '{station_id}', sent heartbeat")
+        else:
+            hub_register(station_id, public_url, cfg)
+
+        # Background heartbeat every 30 seconds
+        threading.Thread(target=_heartbeat_thread, daemon=True).start()
+        print("[hub] Heartbeat thread started (30s interval)")
+
+    # Register clean shutdown handler
+    def _shutdown(sig, frame):
+        print("\n[radio] Shutting down...")
+        hub_deregister()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT,  _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
 
     print(f"[radio] {cfg.get('name', 'AI Radio')} going live...")
     await watcher_loop()

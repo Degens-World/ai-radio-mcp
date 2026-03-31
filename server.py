@@ -711,83 +711,77 @@ def get_embed_code(station_id: str, public_stream_url: str = "") -> str:
 </div>"""
 
 
-# Default hub — Degens.World AI Radio Hub (Supabase)
-_HUB_SUPABASE_URL      = "https://qbziikoagfhvdihdqjqh.supabase.co"
-_HUB_SUPABASE_ANON_KEY = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-    ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFiemlpa29hZ2ZodmRpaGRxanFoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ3OTQ5OTEsImV4cCI6MjA5MDM3MDk5MX0"
-    ".GpRL1r2N7MEt354DaY7iAZ1mLa7_IS-UaAoboDeixnU"
-)
+# Default hub — Degens.World AI Radio Hub (station-api edge function)
+_STATION_API_BASE = "https://qbziikoagfhvdihdqjqh.supabase.co/functions/v1/station-api"
+
+
+def _hub_delete(station_id: str, api_key: str) -> None:
+    """Send DELETE to deregister a station. Best-effort — errors are swallowed."""
+    try:
+        requests.delete(
+            f"{_STATION_API_BASE}/{station_id}",
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 @mcp.tool()
 def register_with_hub(
     station_id: str,
     public_stream_url: str,
-    supabase_url: str = "",
-    supabase_anon_key: str = "",
 ) -> dict:
     """
     Register this station with the AI Radio Hub on Degens.World.
 
-    By default posts to the official Degens.World hub — no extra config needed.
-    Pass supabase_url + supabase_anon_key to use a different Supabase instance.
+    Posts to the official station-api edge function. The returned api_key is
+    saved in the registry — it is shown only once and is required for all future
+    heartbeat / delete calls.
 
     Parameters
     ----------
     station_id        : Station to register
     public_stream_url : Publicly accessible HLS stream URL (ngrok, Cloudflare Tunnel, etc.)
-    supabase_url      : Override Supabase project URL (optional)
-    supabase_anon_key : Override Supabase anon key (optional)
     """
     station = _get_station(station_id)
 
-    sb_url = (supabase_url  or _HUB_SUPABASE_URL).rstrip("/")
-    sb_key =  supabase_anon_key or _HUB_SUPABASE_ANON_KEY
-
-    row = {
-        "id":            station_id,
-        "name":          station.get("name", "Unnamed Station"),
-        "tagline":       station.get("tagline", ""),
-        "stream_url":    public_stream_url,
-        "dj_name":       station.get("dj", {}).get("name", ""),
-        "content_type":  station.get("content", {}).get("source", "freestyle"),
-        "registered_at": int(time.time() * 1000),
-        "last_seen_at":  int(time.time() * 1000),
-        "online":        True,
-    }
-
-    headers = {
-        "apikey":        sb_key,
-        "Authorization": f"Bearer {sb_key}",
-        "Content-Type":  "application/json",
-        "Prefer":        "resolution=merge-duplicates",  # upsert
+    body = {
+        "id":           station_id,
+        "name":         station.get("name", "Unnamed Station"),
+        "stream_url":   public_stream_url,
+        "tagline":      station.get("tagline", ""),
+        "dj_name":      station.get("dj", {}).get("name", ""),
+        "content_type": station.get("content", {}).get("source", "freestyle"),
+        "online":       True,
     }
 
     try:
         resp = requests.post(
-            f"{sb_url}/rest/v1/stations",
-            json=row,
-            headers=headers,
+            _STATION_API_BASE,
+            json=body,
+            headers={"Content-Type": "application/json"},
             timeout=15,
         )
         resp.raise_for_status()
-        station["hub_supabase_url"] = sb_url
-        station["stream_url"]       = public_stream_url
-        station["online"]           = True
+        data = resp.json()
+        api_key = data.get("api_key", "")
+        station["hub_api_key"]  = api_key
+        station["stream_url"]   = public_stream_url
+        station["online"]       = True
         _save_registry()
         return {
             "status":     "registered",
-            "hub":        sb_url,
             "station_id": station_id,
             "stream_url": public_stream_url,
+            "api_key":    api_key,
+            "note":       "api_key saved to registry. It is required for heartbeats and deletes.",
         }
     except Exception as e:
         return {
             "status":  "error",
             "message": str(e),
-            "row":     row,
-            "note":    "Check that the Supabase URL and anon key are correct.",
+            "body":    body,
         }
 
 
@@ -845,9 +839,14 @@ def station_status(station_id: str) -> dict:
 
 @mcp.tool()
 def stop_station(station_id: str) -> dict:
-    """Stop a running radio station."""
+    """Stop a running radio station and mark it offline on the hub."""
     station = _get_station(station_id)
     pid     = station.get("process_pid")
+
+    # Mark offline on hub via DELETE
+    api_key = station.get("hub_api_key", "")
+    if api_key:
+        _hub_delete(station_id, api_key)
 
     if pid:
         try:
